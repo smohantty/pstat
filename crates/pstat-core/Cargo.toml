@@ -1,0 +1,17 @@
+[package]
+name = "pstat-core"
+description = "Process stat collection library — schema, parsers, collectors"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+comfy-table.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

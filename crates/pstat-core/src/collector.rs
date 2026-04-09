@@ -1,0 +1,55 @@
+use crate::schema::{ProcessInfo, ProcessSnapshot};
+
+/// How to identify the target process.
+#[derive(Clone, Debug)]
+pub enum ProcessTarget {
+    Pid(u32),
+    Name(String),
+    ExeContains(String),
+}
+
+/// Query for process discovery.
+#[derive(Clone, Debug)]
+pub enum DiscoverQuery {
+    /// Exact match on /proc/[pid]/comm.
+    ByName(String),
+    /// Substring match on cmdline or exe path.
+    ByExeContains(String),
+    /// Glob pattern match.
+    ByPattern(String),
+    /// List all processes.
+    All,
+}
+
+/// Errors that can occur during stat collection.
+#[derive(Debug, thiserror::Error)]
+pub enum PstatError {
+    #[error("process not found: {0}")]
+    ProcessNotFound(String),
+
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
+    #[error("target unreachable: {0}")]
+    TargetUnreachable(String),
+
+    #[error("parse error: {0}")]
+    ParseError(String),
+
+    #[error("ambiguous match: {0} processes found for \"{1}\": {2:?}")]
+    AmbiguousMatch(usize, String, Vec<ProcessInfo>),
+
+    #[error("process identity mismatch: PID {0} was replaced between discovery and snapshot")]
+    IdentityMismatch(u32),
+
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// All implementations are synchronous. `RsdbCollector` invokes rsdb via
+/// `std::process::Command`.
+pub trait Collector {
+    fn snapshot(&self, target: &ProcessTarget) -> Result<ProcessSnapshot, PstatError>;
+    fn discover(&self, query: &DiscoverQuery) -> Result<Vec<ProcessInfo>, PstatError>;
+    fn total_memory(&self) -> Result<u64, PstatError>;
+}
