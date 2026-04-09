@@ -472,6 +472,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "comfy-table",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

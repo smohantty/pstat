@@ -39,7 +39,7 @@ pub enum PstatError {
     #[error("ambiguous match: {0} processes found for \"{1}\": {2:?}")]
     AmbiguousMatch(usize, String, Vec<ProcessInfo>),
 
-    #[error("process identity mismatch: PID {0} was replaced between discovery and snapshot")]
+    #[error("process identity mismatch: PID {0} changed during collection")]
     IdentityMismatch(u32),
 
     #[error("{0}")]
@@ -52,4 +52,20 @@ pub trait Collector {
     fn snapshot(&self, target: &ProcessTarget) -> Result<ProcessSnapshot, PstatError>;
     fn discover(&self, query: &DiscoverQuery) -> Result<Vec<ProcessInfo>, PstatError>;
     fn total_memory(&self) -> Result<u64, PstatError>;
+}
+
+pub(crate) fn ticks_to_millis(ticks: u64, hz: u64) -> u64 {
+    ticks.saturating_mul(1000) / hz
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ticks_to_millis;
+
+    #[test]
+    fn ticks_to_millis_uses_runtime_hz() {
+        assert_eq!(ticks_to_millis(250, 250), 1000);
+        assert_eq!(ticks_to_millis(1000, 1000), 1000);
+        assert_eq!(ticks_to_millis(125, 250), 500);
+    }
 }

@@ -157,11 +157,11 @@ pub struct SampleSummary {
     pub vm_hwm_max: f64,
     /// Peak swap usage observed across all samples.
     pub vm_swap_max: f64,
-    pub cpu_percent: StatBucket,
-    pub io_read_rate: StatBucket,
-    pub io_write_rate: StatBucket,
+    pub cpu_percent: Option<StatBucket>,
+    pub io_read_rate: Option<StatBucket>,
+    pub io_write_rate: Option<StatBucket>,
     pub num_threads: StatBucket,
-    pub num_fds: StatBucket,
+    pub num_fds: Option<StatBucket>,
     pub rss_trend: Trend,
 }
 
@@ -179,7 +179,13 @@ impl StatBucket {
     /// Compute stats from a slice of values. Returns zeros if empty.
     pub fn from_values(values: &[f64]) -> Self {
         if values.is_empty() {
-            return Self { min: 0.0, max: 0.0, avg: 0.0, p50: 0.0, p95: 0.0 };
+            return Self {
+                min: 0.0,
+                max: 0.0,
+                avg: 0.0,
+                p50: 0.0,
+                p95: 0.0,
+            };
         }
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -192,6 +198,10 @@ impl StatBucket {
             p50: sorted[n / 2],
             p95: sorted[(n as f64 * 0.95) as usize],
         }
+    }
+
+    pub fn from_nonempty(values: &[f64]) -> Option<Self> {
+        (!values.is_empty()).then(|| Self::from_values(values))
     }
 }
 
@@ -225,7 +235,11 @@ impl Trend {
         }
         let slope = num / den;
         // Normalize slope relative to mean to determine significance.
-        let relative = if y_mean.abs() > f64::EPSILON { slope / y_mean } else { slope };
+        let relative = if y_mean.abs() > f64::EPSILON {
+            slope / y_mean
+        } else {
+            slope
+        };
         if relative > 0.01 {
             Self::Rising
         } else if relative < -0.01 {
@@ -273,7 +287,11 @@ impl DiffSeverity {
             return Self::Significant;
         }
         if before.abs() < f64::EPSILON {
-            return if delta > f64::EPSILON { Self::Significant } else { Self::Minor };
+            return if delta > f64::EPSILON {
+                Self::Significant
+            } else {
+                Self::Minor
+            };
         }
         let pct = delta / before.abs();
         if pct > 0.5 {
@@ -315,6 +333,12 @@ mod tests {
     }
 
     #[test]
+    fn stat_bucket_nonempty_none_for_empty_values() {
+        assert!(StatBucket::from_nonempty(&[]).is_none());
+        assert!(StatBucket::from_nonempty(&[1.0]).is_some());
+    }
+
+    #[test]
     fn trend_rising() {
         assert_eq!(Trend::from_values(&[10.0, 20.0, 30.0]), Trend::Rising);
     }
@@ -331,17 +355,26 @@ mod tests {
 
     #[test]
     fn diff_severity_minor() {
-        assert_eq!(DiffSeverity::classify(100.0, 105.0, false), DiffSeverity::Minor);
+        assert_eq!(
+            DiffSeverity::classify(100.0, 105.0, false),
+            DiffSeverity::Minor
+        );
     }
 
     #[test]
     fn diff_severity_moderate() {
-        assert_eq!(DiffSeverity::classify(100.0, 130.0, false), DiffSeverity::Moderate);
+        assert_eq!(
+            DiffSeverity::classify(100.0, 130.0, false),
+            DiffSeverity::Moderate
+        );
     }
 
     #[test]
     fn diff_severity_significant() {
-        assert_eq!(DiffSeverity::classify(100.0, 200.0, false), DiffSeverity::Significant);
+        assert_eq!(
+            DiffSeverity::classify(100.0, 200.0, false),
+            DiffSeverity::Significant
+        );
     }
 
     #[test]
@@ -349,7 +382,10 @@ mod tests {
         // 60 MB delta is Significant for memory even if percentage is small.
         let before = 1_000_000_000.0;
         let after = before + 60.0 * 1024.0 * 1024.0;
-        assert_eq!(DiffSeverity::classify(before, after, true), DiffSeverity::Significant);
+        assert_eq!(
+            DiffSeverity::classify(before, after, true),
+            DiffSeverity::Significant
+        );
     }
 
     #[test]
@@ -407,7 +443,9 @@ mod tests {
         let series = SampleSeries {
             process_name: "test".into(),
             pid: 1234,
-            source: CollectionSource::Remote { target: "192.168.0.1".into() },
+            source: CollectionSource::Remote {
+                target: "192.168.0.1".into(),
+            },
             interval_ms: 1000,
             samples: vec![],
             summary: None,
@@ -415,6 +453,11 @@ mod tests {
         let json = serde_json::to_string(&series).unwrap();
         let back: SampleSeries = serde_json::from_str(&json).unwrap();
         assert_eq!(back.process_name, "test");
-        assert_eq!(back.source, CollectionSource::Remote { target: "192.168.0.1".into() });
+        assert_eq!(
+            back.source,
+            CollectionSource::Remote {
+                target: "192.168.0.1".into()
+            }
+        );
     }
 }

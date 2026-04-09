@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 
-use crate::collector::{Collector, DiscoverQuery, PstatError, ProcessTarget};
+use crate::collector::{Collector, DiscoverQuery, ProcessTarget, PstatError, ticks_to_millis};
 use crate::proc_parser;
 use crate::schema::{CollectionSource, ProcessInfo, ProcessSnapshot};
 
@@ -28,6 +28,14 @@ impl LocalCollector {
 
     fn read_proc_optional(pid: u32, file: &str) -> Option<String> {
         fs::read_to_string(Self::proc_path(pid, file)).ok()
+    }
+
+    fn clock_ticks_per_second() -> Result<u64, PstatError> {
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz <= 0 {
+            return Err(PstatError::ParseError("local CLK_TCK unavailable".into()));
+        }
+        Ok(hz as u64)
     }
 
     fn snapshot_pid(&self, pid: u32) -> Result<ProcessSnapshot, PstatError> {
@@ -57,14 +65,18 @@ impl LocalCollector {
             .and_then(|c| proc_parser::parse_oom_score(&c));
         let oom_score_adj = Self::read_proc_optional(pid, "oom_score_adj")
             .and_then(|c| proc_parser::parse_oom_score_adj(&c));
-        let cgroup = Self::read_proc_optional(pid, "cgroup")
-            .and_then(|c| proc_parser::parse_cgroup(&c));
+        let cgroup =
+            Self::read_proc_optional(pid, "cgroup").and_then(|c| proc_parser::parse_cgroup(&c));
 
         let total_mem = self.total_memory().unwrap_or(1);
         let rss = status.vm_rss.unwrap_or(0);
-        let mem_percent = if total_mem > 0 { (rss as f64 / total_mem as f64) * 100.0 } else { 0.0 };
+        let mem_percent = if total_mem > 0 {
+            (rss as f64 / total_mem as f64) * 100.0
+        } else {
+            0.0
+        };
 
-        let hz = 100u64;
+        let hz = Self::clock_ticks_per_second()?;
 
         Ok(ProcessSnapshot {
             pid: stat.pid,
@@ -89,8 +101,8 @@ impl LocalCollector {
             referenced: smaps.referenced,
             anonymous: smaps.anonymous,
             swap_pss: smaps.swap_pss,
-            cpu_user_ms: stat.utime * 1000 / hz,
-            cpu_system_ms: stat.stime * 1000 / hz,
+            cpu_user_ms: ticks_to_millis(stat.utime, hz),
+            cpu_system_ms: ticks_to_millis(stat.stime, hz),
             cpu_percent: None,
             io_read_bytes: io.as_ref().map(|i| i.read_bytes),
             io_write_bytes: io.as_ref().map(|i| i.write_bytes),
@@ -129,9 +141,13 @@ impl Collector for LocalCollector {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            let Ok(pid) = name_str.parse::<u32>() else { continue };
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
 
-            let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else { continue };
+            let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+                continue;
+            };
             let comm = comm.trim().to_string();
 
             let matches = match query {
@@ -157,7 +173,11 @@ impl Collector for LocalCollector {
                     .map(|s| s.start_time)
                     .unwrap_or(0);
 
-                results.push(ProcessInfo { pid, name: comm, start_time });
+                results.push(ProcessInfo {
+                    pid,
+                    name: comm,
+                    start_time,
+                });
             }
         }
 
@@ -166,7 +186,8 @@ impl Collector for LocalCollector {
     }
 
     fn total_memory(&self) -> Result<u64, PstatError> {
-        let content = fs::read_to_string("/proc/meminfo").map_err(|e| PstatError::Other(e.into()))?;
+        let content =
+            fs::read_to_string("/proc/meminfo").map_err(|e| PstatError::Other(e.into()))?;
         proc_parser::parse_meminfo_total(&content)
     }
 }

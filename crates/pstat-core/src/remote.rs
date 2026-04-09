@@ -3,7 +3,7 @@ use std::process::Command;
 use chrono::Utc;
 use serde::Deserialize;
 
-use crate::collector::{Collector, DiscoverQuery, PstatError, ProcessTarget};
+use crate::collector::{Collector, DiscoverQuery, ProcessTarget, PstatError, ticks_to_millis};
 use crate::proc_parser;
 use crate::schema::{CollectionSource, ProcessInfo, ProcessSnapshot};
 
@@ -34,17 +34,27 @@ pub struct RsdbCollector {
     pub target: String,
     /// Cached total memory from target's /proc/meminfo.
     total_mem_cache: std::cell::Cell<Option<u64>>,
+    /// Cached CLK_TCK from the remote target.
+    clock_tick_cache: std::cell::Cell<Option<u64>>,
 }
 
 impl RsdbCollector {
     pub fn new(target: String) -> Self {
-        Self { target, total_mem_cache: std::cell::Cell::new(None) }
+        Self {
+            target,
+            total_mem_cache: std::cell::Cell::new(None),
+            clock_tick_cache: std::cell::Cell::new(None),
+        }
     }
 
     /// Execute a command on the remote target via rsdb agent exec.
     fn exec(&self, args: &[&str]) -> Result<String, PstatError> {
         let mut cmd = Command::new("rsdb");
-        cmd.arg("agent").arg("exec").arg("--target").arg(&self.target).arg("--");
+        cmd.arg("agent")
+            .arg("exec")
+            .arg("--target")
+            .arg(&self.target)
+            .arg("--");
         for a in args {
             cmd.arg(a);
         }
@@ -58,9 +68,8 @@ impl RsdbCollector {
         })?;
 
         let json_str = String::from_utf8_lossy(&output.stdout);
-        let resp: RsdbResponse = serde_json::from_str(&json_str).map_err(|e| {
-            PstatError::ParseError(format!("rsdb response: {e}"))
-        })?;
+        let resp: RsdbResponse = serde_json::from_str(&json_str)
+            .map_err(|e| PstatError::ParseError(format!("rsdb response: {e}")))?;
 
         if !resp.ok {
             let err = resp.error.unwrap_or(RsdbError {
@@ -70,10 +79,16 @@ impl RsdbCollector {
             if err.code.contains("connection") {
                 return Err(PstatError::TargetUnreachable(err.message));
             }
-            return Err(PstatError::Other(anyhow::anyhow!("rsdb error [{}]: {}", err.code, err.message)));
+            return Err(PstatError::Other(anyhow::anyhow!(
+                "rsdb error [{}]: {}",
+                err.code,
+                err.message
+            )));
         }
 
-        let data = resp.data.ok_or_else(|| PstatError::ParseError("rsdb: missing data".into()))?;
+        let data = resp
+            .data
+            .ok_or_else(|| PstatError::ParseError("rsdb: missing data".into()))?;
         if data.status != 0 {
             let stderr = data.stderr.unwrap_or_default();
             if stderr.contains("No such file") || stderr.contains("No such process") {
@@ -87,6 +102,24 @@ impl RsdbCollector {
     /// Execute a shell command on the remote target.
     fn exec_sh(&self, script: &str) -> Result<String, PstatError> {
         self.exec(&["sh", "-c", script])
+    }
+
+    fn clock_ticks_per_second(&self) -> Result<u64, PstatError> {
+        if let Some(cached) = self.clock_tick_cache.get() {
+            return Ok(cached);
+        }
+
+        let stdout = self.exec(&["getconf", "CLK_TCK"])?;
+        let hz = stdout
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| PstatError::ParseError(format!("remote CLK_TCK: {e}")))?;
+        if hz == 0 {
+            return Err(PstatError::ParseError("remote CLK_TCK was zero".into()));
+        }
+
+        self.clock_tick_cache.set(Some(hz));
+        Ok(hz)
     }
 
     /// Batched collection: read all /proc files AND /proc/meminfo in one round trip.
@@ -183,7 +216,14 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
             0 => return Err(PstatError::ProcessNotFound(format!("name '{name}'"))),
             1 => matches[0],
             n => {
-                let infos = matches.iter().map(|&pid| ProcessInfo { pid, name: name.to_string(), start_time: 0 }).collect();
+                let infos = matches
+                    .iter()
+                    .map(|&pid| ProcessInfo {
+                        pid,
+                        name: name.to_string(),
+                        start_time: 0,
+                    })
+                    .collect();
                 return Err(PstatError::AmbiguousMatch(n, name.to_string(), infos));
             }
         };
@@ -192,7 +232,11 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
         self.snapshot_pid(pid, None)
     }
 
-    fn snapshot_pid(&self, pid: u32, expected_start_time: Option<u64>) -> Result<ProcessSnapshot, PstatError> {
+    fn snapshot_pid(
+        &self,
+        pid: u32,
+        expected_start_time: Option<u64>,
+    ) -> Result<ProcessSnapshot, PstatError> {
         let batch = self.collect_batch(pid)?;
 
         let stat = proc_parser::parse_stat(&batch.stat)?;
@@ -209,13 +253,20 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
         }
 
         let num_fds = batch.fd.and_then(|s| {
-            s.trim().lines().find(|l| l.trim() != "PSTAT_OK").and_then(|l| l.trim().parse::<u32>().ok())
+            s.trim()
+                .lines()
+                .find(|l| l.trim() != "PSTAT_OK")
+                .and_then(|l| l.trim().parse::<u32>().ok())
         });
 
         let total_mem = proc_parser::parse_meminfo_total(&batch.meminfo).unwrap_or(1);
         let rss = status.vm_rss.unwrap_or(0);
-        let mem_percent = if total_mem > 0 { (rss as f64 / total_mem as f64) * 100.0 } else { 0.0 };
-        let hz = 100u64;
+        let mem_percent = if total_mem > 0 {
+            (rss as f64 / total_mem as f64) * 100.0
+        } else {
+            0.0
+        };
+        let hz = self.clock_ticks_per_second()?;
 
         Ok(ProcessSnapshot {
             pid: stat.pid,
@@ -240,8 +291,8 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
             referenced: smaps.referenced,
             anonymous: smaps.anonymous,
             swap_pss: smaps.swap_pss,
-            cpu_user_ms: stat.utime * 1000 / hz,
-            cpu_system_ms: stat.stime * 1000 / hz,
+            cpu_user_ms: ticks_to_millis(stat.utime, hz),
+            cpu_system_ms: ticks_to_millis(stat.stime, hz),
             cpu_percent: None,
             io_read_bytes: io.as_ref().map(|i| i.read_bytes),
             io_write_bytes: io.as_ref().map(|i| i.write_bytes),
@@ -255,7 +306,9 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
             oom_score_adj: proc_parser::parse_oom_score_adj(&batch.oom_adj_str),
             cgroup: proc_parser::parse_cgroup(&batch.cgroup_str),
             timestamp: Utc::now(),
-            source: CollectionSource::Remote { target: self.target.clone() },
+            source: CollectionSource::Remote {
+                target: self.target.clone(),
+            },
         })
     }
 }
@@ -301,9 +354,13 @@ impl Collector for RsdbCollector {
                 continue;
             }
             let mut parts = line.splitn(2, char::is_whitespace);
-            let Some(pid_str) = parts.next() else { continue };
+            let Some(pid_str) = parts.next() else {
+                continue;
+            };
             let Some(comm) = parts.next() else { continue };
-            let Ok(pid) = pid_str.trim().parse::<u32>() else { continue };
+            let Ok(pid) = pid_str.trim().parse::<u32>() else {
+                continue;
+            };
             let comm = comm.trim().to_string();
 
             let matches = match query {
@@ -317,7 +374,11 @@ impl Collector for RsdbCollector {
             };
 
             if matches {
-                results.push(ProcessInfo { pid, name: comm, start_time: 0 });
+                results.push(ProcessInfo {
+                    pid,
+                    name: comm,
+                    start_time: 0,
+                });
             }
         }
 
@@ -377,7 +438,8 @@ mod tests {
 
     #[test]
     fn parse_rsdb_error_envelope() {
-        let json = r#"{"ok":false,"error":{"code":"connection.refused","message":"target offline"}}"#;
+        let json =
+            r#"{"ok":false,"error":{"code":"connection.refused","message":"target offline"}}"#;
         let resp: RsdbResponse = serde_json::from_str(json).unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, "connection.refused");
