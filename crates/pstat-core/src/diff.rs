@@ -99,6 +99,8 @@ mod tests {
             vm_peak: rss * 3,
             vm_swap: 0,
             shared: 0,
+            rss_file: 0,
+            exe_size: None,
             mem_percent: 0.0,
             cpu_user_ms: 1000,
             cpu_system_ms: 200,

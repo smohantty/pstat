@@ -1,8 +1,8 @@
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table, presets};
 
 use crate::schema::{
-    CollectionSource, DiffReport, DiffSeverity, ProcessSnapshot, SampleSeries, SampleSummary,
-    StatBucket, Trend,
+    CollectionSource, DiffReport, DiffSeverity, MemoryMapReport, ProcessSnapshot, SampleSeries,
+    SampleSummary, StatBucket, Trend, VmaEntry, VmaKind,
 };
 
 /// Format a snapshot as pretty JSON.
@@ -23,7 +23,16 @@ fn format_snapshot_markdown(snapshot: &ProcessSnapshot, verbose: bool) -> String
         .to_string();
 
     let mut md = String::new();
-    md.push_str(&format!("# {} (PID {})\n\n", snapshot.name, snapshot.pid));
+    if let Some(sz) = snapshot.exe_size {
+        md.push_str(&format!(
+            "# {} (PID {}) \u{00b7} size: {}\n\n",
+            snapshot.name,
+            snapshot.pid,
+            fmt_bytes(sz as f64)
+        ));
+    } else {
+        md.push_str(&format!("# {} (PID {})\n\n", snapshot.name, snapshot.pid));
+    }
     if !snapshot.cmdline.is_empty() {
         md.push_str(&format!("`{}`\n\n", snapshot.cmdline.join(" ")));
     }
@@ -31,70 +40,97 @@ fn format_snapshot_markdown(snapshot: &ProcessSnapshot, verbose: bool) -> String
 
     md.push_str("| Metric | Value |\n");
     md.push_str("|--------|-------|\n");
-    md.push_str(&format!("| RSS | {} |\n", fmt_bytes(snapshot.rss as f64)));
-    if let Some(pss) = snapshot.pss {
-        md.push_str(&format!("| PSS | {} |\n", fmt_bytes(pss as f64)));
+    md.push_str(&format!(
+        "| Resident (VmRSS) | {} |\n",
+        fmt_bytes(snapshot.rss as f64)
+    ));
+    if let Some(a) = snapshot.anonymous {
+        md.push_str(&format!(
+            "| Anon (heap+stack) | {} |\n",
+            fmt_bytes(a as f64)
+        ));
+    }
+    md.push_str(&format!(
+        "| File-backed (RssFile) | {} |\n",
+        fmt_bytes(snapshot.rss_file as f64)
+    ));
+    if verbose {
+        md.push_str(&format!(
+            "| Shmem (RssShmem) | {} |\n",
+            fmt_bytes(snapshot.shared as f64)
+        ));
     }
     if let Some(uss) = snapshot.uss {
-        md.push_str(&format!("| USS | {} |\n", fmt_bytes(uss as f64)));
+        md.push_str(&format!("| Unique (USS) | {} |\n", fmt_bytes(uss as f64)));
+    }
+    if let Some(pss) = snapshot.pss {
+        md.push_str(&format!(
+            "| Proportional (Pss) | {} |\n",
+            fmt_bytes(pss as f64)
+        ));
+    }
+    if verbose {
+        if let Some(sc) = snapshot.shared_clean {
+            md.push_str(&format!("| Shared clean | {} |\n", fmt_bytes(sc as f64)));
+        }
+        if let Some(sd) = snapshot.shared_dirty {
+            md.push_str(&format!("| Shared dirty | {} |\n", fmt_bytes(sd as f64)));
+        }
+        if let Some(pc) = snapshot.private_clean {
+            md.push_str(&format!("| Private clean | {} |\n", fmt_bytes(pc as f64)));
+        }
+        if let Some(pd) = snapshot.private_dirty {
+            md.push_str(&format!("| Private dirty | {} |\n", fmt_bytes(pd as f64)));
+        }
+        if let Some(r) = snapshot.referenced {
+            md.push_str(&format!(
+                "| Referenced (recent) | {} |\n",
+                fmt_bytes(r as f64)
+            ));
+        }
+        if let Some(sp) = snapshot.swap_pss {
+            md.push_str(&format!(
+                "| Swap proportional | {} |\n",
+                fmt_bytes(sp as f64)
+            ));
+        }
+        if snapshot.vm_swap > 0 {
+            md.push_str(&format!(
+                "| Swap (VmSwap) | {} |\n",
+                fmt_bytes(snapshot.vm_swap as f64)
+            ));
+        }
+        md.push_str(&format!(
+            "| % of total RAM | {:.2}% |\n",
+            snapshot.mem_percent
+        ));
     }
     if snapshot.vm_hwm > 0 {
         md.push_str(&format!(
-            "| Peak RSS | {} |\n",
+            "| Peak resident (VmHWM) | {} |\n",
             fmt_bytes(snapshot.vm_hwm as f64)
         ));
     }
     if verbose {
-        md.push_str(&format!("| VMS | {} |\n", fmt_bytes(snapshot.vms as f64)));
         md.push_str(&format!(
-            "| VMS Peak | {} |\n",
+            "| Virtual (VmSize) | {} |\n",
+            fmt_bytes(snapshot.vms as f64)
+        ));
+        md.push_str(&format!(
+            "| Peak virtual (VmPeak) | {} |\n",
             fmt_bytes(snapshot.vm_peak as f64)
         ));
-    }
-    if snapshot.vm_swap > 0 {
         md.push_str(&format!(
-            "| Swap | {} |\n",
-            fmt_bytes(snapshot.vm_swap as f64)
+            "| CPU (user) | {} |\n",
+            fmt_ms(snapshot.cpu_user_ms)
         ));
-    }
-    if verbose {
         md.push_str(&format!(
-            "| Shared | {} |\n",
-            fmt_bytes(snapshot.shared as f64)
+            "| CPU (system) | {} |\n",
+            fmt_ms(snapshot.cpu_system_ms)
         ));
-        if let Some(sc) = snapshot.shared_clean {
-            md.push_str(&format!("| Shared Clean | {} |\n", fmt_bytes(sc as f64)));
+        if let Some(pct) = snapshot.cpu_percent {
+            md.push_str(&format!("| CPU % | {:.1}% |\n", pct));
         }
-        if let Some(sd) = snapshot.shared_dirty {
-            md.push_str(&format!("| Shared Dirty | {} |\n", fmt_bytes(sd as f64)));
-        }
-        if let Some(pc) = snapshot.private_clean {
-            md.push_str(&format!("| Private Clean | {} |\n", fmt_bytes(pc as f64)));
-        }
-        if let Some(pd) = snapshot.private_dirty {
-            md.push_str(&format!("| Private Dirty | {} |\n", fmt_bytes(pd as f64)));
-        }
-        if let Some(r) = snapshot.referenced {
-            md.push_str(&format!("| Referenced | {} |\n", fmt_bytes(r as f64)));
-        }
-        if let Some(a) = snapshot.anonymous {
-            md.push_str(&format!("| Anonymous | {} |\n", fmt_bytes(a as f64)));
-        }
-        if let Some(sp) = snapshot.swap_pss {
-            md.push_str(&format!("| Swap PSS | {} |\n", fmt_bytes(sp as f64)));
-        }
-        md.push_str(&format!("| Mem % | {:.2}% |\n", snapshot.mem_percent));
-    }
-    md.push_str(&format!(
-        "| CPU (user) | {} |\n",
-        fmt_ms(snapshot.cpu_user_ms)
-    ));
-    md.push_str(&format!(
-        "| CPU (system) | {} |\n",
-        fmt_ms(snapshot.cpu_system_ms)
-    ));
-    if let Some(pct) = snapshot.cpu_percent {
-        md.push_str(&format!("| CPU % | {:.1}% |\n", pct));
     }
     if let Some(rb) = snapshot.io_read_bytes {
         md.push_str(&format!("| IO Read | {} |\n", fmt_bytes(rb as f64)));
@@ -214,9 +250,18 @@ fn format_snapshot_table(snapshot: &ProcessSnapshot, verbose: bool) -> String {
         .load_preset(presets::UTF8_FULL_CONDENSED)
         .set_content_arrangement(ContentArrangement::Dynamic);
 
+    let title = if let Some(sz) = snapshot.exe_size {
+        format!(
+            "{} (PID {}) \u{00b7} size: {}",
+            snapshot.name,
+            snapshot.pid,
+            fmt_bytes(sz as f64)
+        )
+    } else {
+        format!("{} (PID {})", snapshot.name, snapshot.pid)
+    };
     table.set_header(vec![
-        Cell::new(format!("{} (PID {})", snapshot.name, snapshot.pid))
-            .add_attribute(Attribute::Bold),
+        Cell::new(title).add_attribute(Attribute::Bold),
         Cell::new(format!("{state} \u{00b7} {time}")),
     ]);
 
@@ -229,98 +274,113 @@ fn format_snapshot_table(snapshot: &ProcessSnapshot, verbose: bool) -> String {
     }
 
     table.add_row(vec![
-        Cell::new("RSS"),
+        Cell::new("Resident (VmRSS)"),
         Cell::new(fmt_bytes(snapshot.rss as f64)),
     ]);
-    if let Some(pss) = snapshot.pss {
-        table.add_row(vec![Cell::new("PSS"), Cell::new(fmt_bytes(pss as f64))]);
+    if let Some(a) = snapshot.anonymous {
+        table.add_row(vec![
+            Cell::new("Anon (heap+stack)"),
+            Cell::new(fmt_bytes(a as f64)),
+        ]);
+    }
+    table.add_row(vec![
+        Cell::new("File-backed (RssFile)"),
+        Cell::new(fmt_bytes(snapshot.rss_file as f64)),
+    ]);
+    if verbose {
+        table.add_row(vec![
+            Cell::new("Shmem (RssShmem)"),
+            Cell::new(fmt_bytes(snapshot.shared as f64)),
+        ]);
     }
     if let Some(uss) = snapshot.uss {
-        table.add_row(vec![Cell::new("USS"), Cell::new(fmt_bytes(uss as f64))]);
+        table.add_row(vec![
+            Cell::new("Unique (USS)"),
+            Cell::new(fmt_bytes(uss as f64)),
+        ]);
+    }
+    if let Some(pss) = snapshot.pss {
+        table.add_row(vec![
+            Cell::new("Proportional (Pss)"),
+            Cell::new(fmt_bytes(pss as f64)),
+        ]);
+    }
+    if verbose {
+        if let Some(sc) = snapshot.shared_clean {
+            table.add_row(vec![
+                Cell::new("Shared clean"),
+                Cell::new(fmt_bytes(sc as f64)),
+            ]);
+        }
+        if let Some(sd) = snapshot.shared_dirty {
+            table.add_row(vec![
+                Cell::new("Shared dirty"),
+                Cell::new(fmt_bytes(sd as f64)),
+            ]);
+        }
+        if let Some(pc) = snapshot.private_clean {
+            table.add_row(vec![
+                Cell::new("Private clean"),
+                Cell::new(fmt_bytes(pc as f64)),
+            ]);
+        }
+        if let Some(pd) = snapshot.private_dirty {
+            table.add_row(vec![
+                Cell::new("Private dirty"),
+                Cell::new(fmt_bytes(pd as f64)),
+            ]);
+        }
+        if let Some(r) = snapshot.referenced {
+            table.add_row(vec![
+                Cell::new("Referenced (recent)"),
+                Cell::new(fmt_bytes(r as f64)),
+            ]);
+        }
+        if let Some(sp) = snapshot.swap_pss {
+            table.add_row(vec![
+                Cell::new("Swap proportional"),
+                Cell::new(fmt_bytes(sp as f64)),
+            ]);
+        }
+        if snapshot.vm_swap > 0 {
+            table.add_row(vec![
+                Cell::new("Swap (VmSwap)"),
+                Cell::new(fmt_bytes(snapshot.vm_swap as f64)),
+            ]);
+        }
+        table.add_row(vec![
+            Cell::new("% of total RAM"),
+            Cell::new(format!("{:.2}%", snapshot.mem_percent)),
+        ]);
     }
 
     if snapshot.vm_hwm > 0 {
         table.add_row(vec![
-            Cell::new("Peak RSS"),
+            Cell::new("Peak resident (VmHWM)"),
             Cell::new(fmt_bytes(snapshot.vm_hwm as f64)),
         ]);
     }
 
     if verbose {
         table.add_row(vec![
-            Cell::new("VMS"),
+            Cell::new("Virtual (VmSize)"),
             Cell::new(fmt_bytes(snapshot.vms as f64)),
         ]);
         table.add_row(vec![
-            Cell::new("VMS Peak"),
+            Cell::new("Peak virtual (VmPeak)"),
             Cell::new(fmt_bytes(snapshot.vm_peak as f64)),
         ]);
-    }
-
-    if snapshot.vm_swap > 0 {
         table.add_row(vec![
-            Cell::new("Swap"),
-            Cell::new(fmt_bytes(snapshot.vm_swap as f64)),
+            Cell::new("CPU (user)"),
+            Cell::new(fmt_ms(snapshot.cpu_user_ms)),
         ]);
-    }
-
-    if verbose {
         table.add_row(vec![
-            Cell::new("Shared"),
-            Cell::new(fmt_bytes(snapshot.shared as f64)),
+            Cell::new("CPU (system)"),
+            Cell::new(fmt_ms(snapshot.cpu_system_ms)),
         ]);
-        if let Some(sc) = snapshot.shared_clean {
-            table.add_row(vec![
-                Cell::new("Shared Clean"),
-                Cell::new(fmt_bytes(sc as f64)),
-            ]);
+        if let Some(pct) = snapshot.cpu_percent {
+            table.add_row(vec![Cell::new("CPU %"), Cell::new(format!("{:.1}%", pct))]);
         }
-        if let Some(sd) = snapshot.shared_dirty {
-            table.add_row(vec![
-                Cell::new("Shared Dirty"),
-                Cell::new(fmt_bytes(sd as f64)),
-            ]);
-        }
-        if let Some(pc) = snapshot.private_clean {
-            table.add_row(vec![
-                Cell::new("Private Clean"),
-                Cell::new(fmt_bytes(pc as f64)),
-            ]);
-        }
-        if let Some(pd) = snapshot.private_dirty {
-            table.add_row(vec![
-                Cell::new("Private Dirty"),
-                Cell::new(fmt_bytes(pd as f64)),
-            ]);
-        }
-        if let Some(r) = snapshot.referenced {
-            table.add_row(vec![
-                Cell::new("Referenced"),
-                Cell::new(fmt_bytes(r as f64)),
-            ]);
-        }
-        if let Some(a) = snapshot.anonymous {
-            table.add_row(vec![Cell::new("Anonymous"), Cell::new(fmt_bytes(a as f64))]);
-        }
-        if let Some(sp) = snapshot.swap_pss {
-            table.add_row(vec![Cell::new("Swap PSS"), Cell::new(fmt_bytes(sp as f64))]);
-        }
-        table.add_row(vec![
-            Cell::new("Mem %"),
-            Cell::new(format!("{:.2}%", snapshot.mem_percent)),
-        ]);
-    }
-
-    table.add_row(vec![
-        Cell::new("CPU (user)"),
-        Cell::new(fmt_ms(snapshot.cpu_user_ms)),
-    ]);
-    table.add_row(vec![
-        Cell::new("CPU (system)"),
-        Cell::new(fmt_ms(snapshot.cpu_system_ms)),
-    ]);
-    if let Some(pct) = snapshot.cpu_percent {
-        table.add_row(vec![Cell::new("CPU %"), Cell::new(format!("{:.1}%", pct))]);
     }
 
     if let Some(rb) = snapshot.io_read_bytes {
@@ -390,6 +450,221 @@ pub fn format_table_verbose(snapshot: &ProcessSnapshot) -> String {
     format_snapshot_table(snapshot, true)
 }
 
+// ============================================================================
+// Memory map rendering
+// ============================================================================
+
+fn vma_kind_label(k: VmaKind) -> &'static str {
+    match k {
+        VmaKind::Binary => "Binary",
+        VmaKind::SharedLibrary => "Shared libraries",
+        VmaKind::Heap => "Heap",
+        VmaKind::Stack => "Stacks",
+        VmaKind::AnonOther => "Other anon",
+        VmaKind::Shmem => "Shared memory",
+    }
+}
+
+/// Sum RSS and Size per kind, returning a fixed-order vec of
+/// (kind, rss, size) — ordered for display.
+fn bucket_summary(report: &MemoryMapReport) -> Vec<(VmaKind, u64, u64)> {
+    let order = [
+        VmaKind::Binary,
+        VmaKind::SharedLibrary,
+        VmaKind::Heap,
+        VmaKind::Stack,
+        VmaKind::AnonOther,
+        VmaKind::Shmem,
+    ];
+    order
+        .iter()
+        .map(|&k| {
+            let (rss, size) = report
+                .entries
+                .iter()
+                .filter(|e| e.classify(report.exe_path.as_deref()) == k)
+                .fold((0u64, 0u64), |(r, s), e| (r + e.rss, s + e.size));
+            (k, rss, size)
+        })
+        .collect()
+}
+
+/// Group VMAs by (display label, perm) and sum size / rss / anon across duplicates.
+/// Returns rows sorted by RSS descending. Anonymous entries are collapsed under their label.
+fn group_vmas(entries: &[VmaEntry]) -> Vec<(String, String, u64, u64, u64)> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<(String, String), (u64, u64, u64)> = BTreeMap::new();
+    for e in entries {
+        let key = (e.label.clone(), e.perm.clone());
+        let slot = map.entry(key).or_default();
+        slot.0 += e.size;
+        slot.1 += e.rss;
+        slot.2 += e.anonymous;
+    }
+    let mut rows: Vec<(String, String, u64, u64, u64)> = map
+        .into_iter()
+        .map(|((label, perm), (size, rss, anon))| (label, perm, size, rss, anon))
+        .collect();
+    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    rows
+}
+
+/// Format a memory-map report as a terminal table (or two tables in verbose mode).
+pub fn format_map_table(report: &MemoryMapReport, verbose: bool) -> String {
+    let source = match &report.source {
+        CollectionSource::Local => "local".to_string(),
+        CollectionSource::Remote { target } => format!("remote ({target})"),
+    };
+    let time = report
+        .timestamp
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+
+    let mut out = String::new();
+
+    // Summary table: bucketed RSS breakdown.
+    let mut summary = Table::new();
+    summary
+        .load_preset(presets::UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    let title = if let Some(sz) = report.exe_size {
+        format!(
+            "{} (PID {}) \u{00b7} size: {}",
+            report.name,
+            report.pid,
+            fmt_bytes(sz as f64)
+        )
+    } else {
+        format!("{} (PID {})", report.name, report.pid)
+    };
+    summary.set_header(vec![
+        Cell::new(title).add_attribute(Attribute::Bold),
+        Cell::new(format!("{source} \u{00b7} {time}")),
+    ]);
+
+    summary.add_row(vec![
+        Cell::new("Total RSS").add_attribute(Attribute::Bold),
+        Cell::new(format!("{:>9}  100.0%", fmt_bytes(report.total_rss as f64)))
+            .add_attribute(Attribute::Bold)
+            .set_alignment(CellAlignment::Right),
+    ]);
+
+    let buckets = bucket_summary(report);
+    let total = report.total_rss.max(1);
+    for (kind, rss, _size) in buckets {
+        let pct = (rss as f64 / total as f64) * 100.0;
+        summary.add_row(vec![
+            Cell::new(vma_kind_label(kind)),
+            Cell::new(format!("{:>9}  {:>5.1}%", fmt_bytes(rss as f64), pct))
+                .set_alignment(CellAlignment::Right),
+        ]);
+    }
+    out.push_str(&summary.to_string());
+    out.push('\n');
+
+    if !verbose {
+        return out;
+    }
+
+    // Per-mapping detail table (verbose).
+    let mut detail = Table::new();
+    detail
+        .load_preset(presets::UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+    detail.set_header(vec![
+        Cell::new("Mapping").add_attribute(Attribute::Bold),
+        Cell::new("Perm").add_attribute(Attribute::Bold),
+        Cell::new("Size").add_attribute(Attribute::Bold),
+        Cell::new("RSS").add_attribute(Attribute::Bold),
+        Cell::new("Anon").add_attribute(Attribute::Bold),
+    ]);
+
+    for (label, perm, size, rss, anon) in group_vmas(&report.entries) {
+        if rss < 1024 {
+            continue;
+        }
+        detail.add_row(vec![
+            Cell::new(label),
+            Cell::new(perm),
+            Cell::new(fmt_bytes(size as f64)).set_alignment(CellAlignment::Right),
+            Cell::new(fmt_bytes(rss as f64)).set_alignment(CellAlignment::Right),
+            Cell::new(fmt_bytes(anon as f64)).set_alignment(CellAlignment::Right),
+        ]);
+    }
+    out.push_str(&detail.to_string());
+    out.push('\n');
+
+    out
+}
+
+/// Format the memory-map report as pretty JSON.
+pub fn format_map_json(report: &MemoryMapReport) -> String {
+    serde_json::to_string_pretty(report).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+}
+
+/// Format the memory-map report as markdown.
+pub fn format_map_md(report: &MemoryMapReport, verbose: bool) -> String {
+    let source = match &report.source {
+        CollectionSource::Local => "local".to_string(),
+        CollectionSource::Remote { target } => format!("remote ({target})"),
+    };
+    let time = report
+        .timestamp
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+
+    let mut md = String::new();
+    if let Some(sz) = report.exe_size {
+        md.push_str(&format!(
+            "# {} (PID {}) \u{00b7} size: {}\n\n",
+            report.name,
+            report.pid,
+            fmt_bytes(sz as f64)
+        ));
+    } else {
+        md.push_str(&format!("# {} (PID {})\n\n", report.name, report.pid));
+    }
+    md.push_str(&format!("{source} \u{00b7} {time}\n\n"));
+
+    md.push_str("## RSS breakdown\n\n");
+    md.push_str("| Source | RSS | % |\n|--------|-----|---|\n");
+    md.push_str(&format!(
+        "| **Total** | **{}** | 100% |\n",
+        fmt_bytes(report.total_rss as f64)
+    ));
+    let total = report.total_rss.max(1);
+    for (kind, rss, _) in bucket_summary(report) {
+        let pct = (rss as f64 / total as f64) * 100.0;
+        md.push_str(&format!(
+            "| {} | {} | {:.1}% |\n",
+            vma_kind_label(kind),
+            fmt_bytes(rss as f64),
+            pct
+        ));
+    }
+
+    if verbose {
+        md.push_str("\n## Per-mapping detail\n\n");
+        md.push_str("| Mapping | Perm | Size | RSS | Anon |\n|---------|------|------|-----|------|\n");
+        for (label, perm, size, rss, anon) in group_vmas(&report.entries) {
+            if rss < 1024 {
+                continue;
+            }
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                label,
+                perm,
+                fmt_bytes(size as f64),
+                fmt_bytes(rss as f64),
+                fmt_bytes(anon as f64)
+            ));
+        }
+    }
+
+    md
+}
+
 /// Format a diff report as a professional terminal table using comfy-table.
 pub fn format_diff_table(report: &DiffReport) -> String {
     let mut out = String::new();
@@ -416,6 +691,15 @@ pub fn format_diff_table(report: &DiffReport) -> String {
             "RSS" | "VMS" | "VM Peak" | "VM Swap" | "Shared" | "IO Read" | "IO Write"
         );
         let is_cpu_time = matches!(d.name.as_str(), "CPU (user)" | "CPU (system)");
+
+        let display_name = match d.name.as_str() {
+            "RSS" => "Resident (VmRSS)",
+            "VMS" => "Virtual (VmSize)",
+            "VM Peak" => "Peak virtual (VmPeak)",
+            "VM Swap" => "Swap (VmSwap)",
+            "Shared" => "Shmem (RssShmem)",
+            other => other,
+        };
 
         let severity_marker = match d.severity {
             DiffSeverity::Significant => "\u{25b2}\u{25b2}\u{25b2}",
@@ -466,7 +750,7 @@ pub fn format_diff_table(report: &DiffReport) -> String {
         };
 
         table.add_row(vec![
-            Cell::new(&d.name),
+            Cell::new(display_name),
             Cell::new(&b).set_alignment(CellAlignment::Right),
             Cell::new(&a).set_alignment(CellAlignment::Right),
             Cell::new(&delta).set_alignment(CellAlignment::Right),
@@ -590,7 +874,7 @@ pub fn format_markdown(series: &SampleSeries) -> String {
     md.push_str("| Metric | Min | Max | Avg | P95 | Trend |\n");
     md.push_str("|--------|-----|-----|-----|-----|-------|\n");
     md.push_str(&format!(
-        "| RSS | {} | {} | {} | {} | {:?} |\n",
+        "| Resident (VmRSS) | {} | {} | {} | {} | {:?} |\n",
         fmt_bytes(summary.rss.min),
         fmt_bytes(summary.rss.max),
         fmt_bytes(summary.rss.avg),
@@ -598,19 +882,19 @@ pub fn format_markdown(series: &SampleSeries) -> String {
         summary.rss_trend
     ));
     md.push_str(&format!(
-        "| VMS | {} | {} | {} | {} | - |\n",
+        "| Virtual (VmSize) | {} | {} | {} | {} | - |\n",
         fmt_bytes(summary.vms.min),
         fmt_bytes(summary.vms.max),
         fmt_bytes(summary.vms.avg),
         fmt_bytes(summary.vms.p95),
     ));
     md.push_str(&format!(
-        "| Peak RSS (all-time) | - | {} | - | - | - |\n",
+        "| Peak resident (VmHWM) | - | {} | - | - | - |\n",
         fmt_bytes(summary.vm_hwm_max)
     ));
     if summary.vm_swap_max > 0.0 {
         md.push_str(&format!(
-            "| Swap (max) | - | {} | - | - | - |\n",
+            "| Swap (VmSwap) | - | {} | - | - | - |\n",
             fmt_bytes(summary.vm_swap_max)
         ));
     }
@@ -750,7 +1034,7 @@ pub fn format_report_table(series: &SampleSeries) -> String {
             Cell::new("Trend"),
         ]);
     mem_table.add_row(vec![
-        Cell::new("RSS"),
+        Cell::new("Resident (VmRSS)"),
         Cell::new(fmt_bytes(summary.rss.min)).set_alignment(CellAlignment::Right),
         Cell::new(fmt_bytes(summary.rss.max)).set_alignment(CellAlignment::Right),
         Cell::new(fmt_bytes(summary.rss.avg)).set_alignment(CellAlignment::Right),
@@ -758,16 +1042,16 @@ pub fn format_report_table(series: &SampleSeries) -> String {
         Cell::new(format!("{:?}", summary.rss_trend)),
     ]);
     mem_table.add_row(vec![
-        Cell::new("Peak RSS"),
+        Cell::new("Peak resident (VmHWM)"),
         Cell::new(""),
         Cell::new(fmt_bytes(summary.vm_hwm_max)).set_alignment(CellAlignment::Right),
         Cell::new(""),
         Cell::new(""),
-        Cell::new("all-time"),
+        Cell::new(""),
     ]);
     if summary.vm_swap_max > 0.0 {
         mem_table.add_row(vec![
-            Cell::new("Swap"),
+            Cell::new("Swap (VmSwap)"),
             Cell::new(""),
             Cell::new(fmt_bytes(summary.vm_swap_max)).set_alignment(CellAlignment::Right),
             Cell::new(""),
@@ -879,6 +1163,8 @@ mod tests {
             vm_peak: rss * 3,
             vm_swap: 0,
             shared: 0,
+            rss_file: 0,
+            exe_size: None,
             mem_percent: 0.0,
             cpu_user_ms: 1000,
             cpu_system_ms: 200,
@@ -920,14 +1206,15 @@ mod tests {
     fn format_table_clean() {
         let snap = make_snap(1024 * 1024, None);
         let table = format_table(&snap);
-        assert!(table.contains("RSS"));
-        assert!(table.contains("Peak RSS"));
-        assert!(table.contains("CPU (user)"));
+        assert!(table.contains("Resident (VmRSS)"));
+        assert!(table.contains("File-backed (RssFile)"));
+        assert!(table.contains("Peak resident (VmHWM)"));
         assert!(table.contains("IO Read"));
         assert!(table.contains("Threads"));
         assert!(table.contains("test"));
-        // Clean format should NOT show VMS or context switches
-        assert!(!table.contains("VMS"));
+        // Clean format should NOT show CPU, virtual-memory rows, or context switches.
+        assert!(!table.contains("CPU (user)"));
+        assert!(!table.contains("Virtual (VmSize)"));
         assert!(!table.contains("CtxSw"));
     }
 
@@ -935,9 +1222,10 @@ mod tests {
     fn format_table_verbose_shows_all() {
         let snap = make_snap(1024 * 1024, None);
         let table = format_table_verbose(&snap);
-        assert!(table.contains("RSS"));
-        assert!(table.contains("VMS"));
-        assert!(table.contains("Peak RSS"));
+        assert!(table.contains("Resident (VmRSS)"));
+        assert!(table.contains("Virtual (VmSize)"));
+        assert!(table.contains("Peak resident (VmHWM)"));
+        assert!(table.contains("Peak virtual (VmPeak)"));
         assert!(table.contains("CtxSw"));
         assert!(table.contains("Cmdline"));
     }

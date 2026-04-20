@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::collector::{Collector, DiscoverQuery, ProcessTarget, PstatError, ticks_to_millis};
 use crate::proc_parser;
-use crate::schema::{CollectionSource, ProcessInfo, ProcessSnapshot};
+use crate::schema::{CollectionSource, MemoryMapReport, ProcessInfo, ProcessSnapshot};
 
 /// Minimal struct mirroring rsdb agent exec JSON envelope.
 /// We own this struct to avoid coupling to rsdb-proto.
@@ -145,15 +145,17 @@ cat /proc/{pid}/oom_score 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR
 echo '---PSTAT_SEP---'
 cat /proc/{pid}/oom_score_adj 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR
 echo '---PSTAT_SEP---'
-cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
+cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR
+echo '---PSTAT_SEP---'
+stat -L -c %s /proc/{pid}/exe 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
         );
 
         let stdout = self.exec_sh(&script)?;
         let sections: Vec<&str> = stdout.split("---PSTAT_SEP---").collect();
 
-        if sections.len() < 11 {
+        if sections.len() < 12 {
             return Err(PstatError::ParseError(format!(
-                "expected 11 sections, got {}",
+                "expected 12 sections, got {}",
                 sections.len()
             )));
         }
@@ -169,6 +171,7 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
         let (_oom_ok, oom_score_str) = proc_parser::check_section_status(sections[8]);
         let (_oomadj_ok, oom_adj_str) = proc_parser::check_section_status(sections[9]);
         let (_cgroup_ok, cgroup_str) = proc_parser::check_section_status(sections[10]);
+        let (_exe_ok, exe_size_str) = proc_parser::check_section_status(sections[11]);
 
         if !stat_ok || !status_ok || !comm_ok {
             return Err(PstatError::ProcessNotFound(format!(
@@ -188,6 +191,7 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
             oom_score_str,
             oom_adj_str,
             cgroup_str,
+            exe_size_str,
         })
     }
 
@@ -281,6 +285,8 @@ cat /proc/{pid}/cgroup 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
             vm_peak: status.vm_peak.unwrap_or(0),
             vm_swap: status.vm_swap.unwrap_or(0),
             shared: status.rss_shared.unwrap_or(0),
+            rss_file: status.rss_file.unwrap_or(0),
+            exe_size: batch.exe_size_str.trim().parse::<u64>().ok(),
             mem_percent,
             pss: smaps.pss,
             uss: smaps.uss(),
@@ -325,6 +331,7 @@ struct BatchedResult {
     oom_score_str: String,
     oom_adj_str: String,
     cgroup_str: String,
+    exe_size_str: String,
 }
 
 impl Collector for RsdbCollector {
@@ -394,6 +401,63 @@ impl Collector for RsdbCollector {
         let total = proc_parser::parse_meminfo_total(&stdout)?;
         self.total_mem_cache.set(Some(total));
         Ok(total)
+    }
+
+    fn memory_map(&self, target: &ProcessTarget) -> Result<MemoryMapReport, PstatError> {
+        let pid = resolve_remote_pid(self, target)?;
+        let script = format!(
+            r#"cat /proc/{pid}/smaps && echo PSTAT_OK || echo PSTAT_ERR
+echo '---PSTAT_SEP---'
+cat /proc/{pid}/comm && echo PSTAT_OK || echo PSTAT_ERR
+echo '---PSTAT_SEP---'
+readlink /proc/{pid}/exe 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR
+echo '---PSTAT_SEP---'
+stat -L -c %s /proc/{pid}/exe 2>/dev/null && echo PSTAT_OK || echo PSTAT_ERR"#
+        );
+        let stdout = self.exec_sh(&script)?;
+        let sections: Vec<&str> = stdout.split("---PSTAT_SEP---").collect();
+        if sections.len() < 4 {
+            return Err(PstatError::ParseError(format!(
+                "expected 4 sections, got {}",
+                sections.len()
+            )));
+        }
+
+        let (smaps_ok, smaps) = proc_parser::check_section_status(sections[0]);
+        let (comm_ok, comm) = proc_parser::check_section_status(sections[1]);
+        let (_exe_ok, exe_str) = proc_parser::check_section_status(sections[2]);
+        let (_size_ok, exe_size_str) = proc_parser::check_section_status(sections[3]);
+
+        if !smaps_ok || !comm_ok {
+            return Err(PstatError::ProcessNotFound(format!(
+                "critical /proc files unreadable for PID {pid}"
+            )));
+        }
+
+        let entries = proc_parser::parse_smaps(&smaps);
+        let total_rss = entries.iter().map(|e| e.rss).sum();
+        let exe_path = {
+            let trimmed = exe_str.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        let exe_size = exe_size_str.trim().parse::<u64>().ok();
+
+        Ok(MemoryMapReport {
+            pid,
+            name: comm.trim().to_string(),
+            exe_path,
+            exe_size,
+            total_rss,
+            entries,
+            timestamp: chrono::Utc::now(),
+            source: CollectionSource::Remote {
+                target: self.target.clone(),
+            },
+        })
     }
 }
 

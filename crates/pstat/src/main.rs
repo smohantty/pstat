@@ -17,7 +17,7 @@ use pstat_core::schema::{ProcessSnapshot, SampleSeries};
 #[derive(Debug, Parser)]
 #[command(name = "pstat")]
 #[command(
-    about = "Process stat collection tool — snapshot, sample, diff, discover, report, schema"
+    about = "Process stat collection tool — snapshot, sample, map, diff, discover, report, schema"
 )]
 #[command(version)]
 struct Cli {
@@ -87,6 +87,24 @@ enum Commands {
         format: Option<OutputFormat>,
         #[arg(long, value_name = "PATH")]
         output: Option<String>,
+    },
+    /// Show per-VMA memory composition (where the RSS is going).
+    Map {
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        exe: Option<String>,
+        #[arg(long, value_name = "ADDR")]
+        target: Option<String>,
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// Include the per-mapping detail table (all VMAs grouped by name+perm).
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Print a terse agent-oriented CLI schema.
     Schema,
@@ -206,6 +224,7 @@ rules:
 
 snapshot [selector] [--target <addr>] [--format json] [--output <path>]
 sample [selector] [--target <addr>] [--interval <duration>] [--count <usize>] [--format json] [--output <path>]
+map [selector] [--target <addr>] [--format json] [--output <path>] [-v]
 discover [--target <addr>] [--filter <glob>]
 diff <snapshot1.json> <snapshot2.json> [--format json]
 report <samples.json> [--format json] [--output <path>]
@@ -446,6 +465,30 @@ fn run() -> Result<(), PstatError> {
             }
         }
 
+        Commands::Map {
+            pid,
+            name,
+            exe,
+            target,
+            format,
+            output,
+            verbose,
+        } => {
+            let proc_target = resolve_target(pid, name, exe).map_err(|e| PstatError::Other(e))?;
+            let collector = make_collector(target);
+            let report_data = collector.memory_map(&proc_target)?;
+            let fmt = default_format(format);
+            let text = match fmt {
+                OutputFormat::Json => report::format_map_json(&report_data),
+                OutputFormat::Table => report::format_map_table(&report_data, verbose),
+                OutputFormat::Md => report::format_map_md(&report_data, verbose),
+            };
+            write_output(&text, output.as_deref()).map_err(|e| PstatError::Other(e))?;
+            if !text.ends_with('\n') {
+                println!();
+            }
+        }
+
         Commands::Schema => {
             print!("{}", cli_schema());
         }
@@ -474,6 +517,8 @@ mod tests {
             vm_peak: rss * 2,
             vm_swap: 0,
             shared: 0,
+            rss_file: 0,
+            exe_size: None,
             mem_percent: 0.0,
             pss: None,
             uss: None,

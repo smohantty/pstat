@@ -5,7 +5,7 @@
 //! content via rsdb agent exec) share the same parsing logic.
 
 use crate::collector::PstatError;
-use crate::schema::ProcessState;
+use crate::schema::{ProcessState, VmaEntry};
 
 /// Fields extracted from /proc/[pid]/stat.
 #[derive(Debug)]
@@ -101,6 +101,7 @@ pub struct StatusFields {
     pub vm_hwm: Option<u64>,
     pub vm_swap: Option<u64>,
     pub rss_shared: Option<u64>,
+    pub rss_file: Option<u64>,
     pub threads: Option<u32>,
     pub voluntary_ctxt_switches: Option<u64>,
     pub nonvoluntary_ctxt_switches: Option<u64>,
@@ -119,6 +120,7 @@ pub fn parse_status(content: &str) -> Result<StatusFields, PstatError> {
             "VmHWM" => f.vm_hwm = parse_kb_to_bytes(val),
             "VmSwap" => f.vm_swap = parse_kb_to_bytes(val),
             "RssShmem" => f.rss_shared = parse_kb_to_bytes(val),
+            "RssFile" => f.rss_file = parse_kb_to_bytes(val),
             "Threads" => f.threads = val.parse().ok(),
             "voluntary_ctxt_switches" => f.voluntary_ctxt_switches = val.parse().ok(),
             "nonvoluntary_ctxt_switches" => f.nonvoluntary_ctxt_switches = val.parse().ok(),
@@ -288,6 +290,120 @@ pub fn parse_smaps_rollup(content: &str) -> Result<Option<SmapsFields>, PstatErr
     Ok(Some(f))
 }
 
+/// Parse /proc/[pid]/smaps into per-VMA entries. Each VMA block starts with a
+/// header line (address range + perm + offset + dev + inode + optional path)
+/// followed by key:value detail lines.
+pub fn parse_smaps(content: &str) -> Vec<VmaEntry> {
+    let mut entries: Vec<VmaEntry> = Vec::new();
+    let mut current: Option<VmaEntry> = None;
+
+    for line in content.lines() {
+        if is_smaps_header(line) {
+            if let Some(e) = current.take() {
+                entries.push(e);
+            }
+            current = Some(parse_smaps_header(line));
+        } else if let Some(ref mut e) = current {
+            let Some((key, val)) = line.split_once(':') else { continue };
+            let val = val.trim();
+            let Some(bytes) = parse_kb_to_bytes(val) else { continue };
+            match key.trim() {
+                "Size" => e.size = bytes,
+                "Rss" => e.rss = bytes,
+                "Pss" => e.pss = bytes,
+                "Anonymous" => e.anonymous = bytes,
+                "Swap" => e.swap = bytes,
+                _ => {}
+            }
+        }
+    }
+    if let Some(e) = current.take() {
+        entries.push(e);
+    }
+    detect_glibc_arenas(&mut entries);
+    entries
+}
+
+/// Detect glibc secondary malloc arenas and relabel them as `[glibc-arena]`.
+///
+/// Signature: a private anonymous rw-p VMA followed immediately (same end/start
+/// address) by a private anonymous ---p guard VMA. This is how glibc carves
+/// secondary arenas for per-thread malloc — initial mmap allocates a 1 MB region
+/// PROT_NONE then mprotects the used portion to RW, leaving the unused tail as
+/// ---p. The kernel doesn't semantically label these so they otherwise land in
+/// the "other anon" bucket even though they're really part of the heap.
+fn detect_glibc_arenas(entries: &mut [VmaEntry]) {
+    for i in 0..entries.len().saturating_sub(1) {
+        let is_arena = {
+            let data = &entries[i];
+            let guard = &entries[i + 1];
+            data.path.is_none()
+                && data.label == "anon"
+                && data.perm == "rw-p"
+                && guard.path.is_none()
+                && guard.label == "anon"
+                && guard.perm == "---p"
+                && data.end_addr == guard.start_addr
+        };
+        if is_arena {
+            entries[i].label = "[glibc-arena]".to_string();
+        }
+    }
+}
+
+fn is_smaps_header(line: &str) -> bool {
+    let first = line.split_whitespace().next().unwrap_or("");
+    let Some((start, end)) = first.split_once('-') else {
+        return false;
+    };
+    !start.is_empty()
+        && !end.is_empty()
+        && start.chars().all(|c| c.is_ascii_hexdigit())
+        && end.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn parse_smaps_header(line: &str) -> VmaEntry {
+    let mut it = line.split_whitespace();
+    let range = it.next().unwrap_or("");
+    let (start_addr, end_addr) = range
+        .split_once('-')
+        .and_then(|(s, e)| Some((u64::from_str_radix(s, 16).ok()?, u64::from_str_radix(e, 16).ok()?)))
+        .unwrap_or((0, 0));
+    let perm = it.next().unwrap_or("").to_string();
+    let _offset = it.next();
+    let _device = it.next();
+    let _inode = it.next();
+    let tail: Vec<&str> = it.collect();
+    let tail_joined = tail.join(" ");
+
+    let (path, label) = if tail_joined.is_empty() {
+        (None, "anon".to_string())
+    } else if tail_joined.starts_with('[') {
+        // [heap], [stack], [stack:TID], [tstack: ...], [vdso], [vectors], etc.
+        (None, tail_joined.clone())
+    } else {
+        let basename = tail_joined
+            .rsplit('/')
+            .next()
+            .unwrap_or(&tail_joined)
+            .to_string();
+        (Some(tail_joined), basename)
+    };
+
+    VmaEntry {
+        start_addr,
+        end_addr,
+        perm,
+        path,
+        label,
+        size: 0,
+        rss: 0,
+        pss: 0,
+        anonymous: 0,
+        swap: 0,
+    }
+}
+
 /// Parse /proc/[pid]/oom_score (single integer).
 pub fn parse_oom_score(content: &str) -> Option<u32> {
     content.trim().parse().ok()
@@ -448,6 +564,7 @@ cancelled_write_bytes: 631136256";
         assert_eq!(f.vm_rss, Some(2800 * 1024));
         assert_eq!(f.vm_swap, Some(5292 * 1024));
         assert_eq!(f.rss_shared, Some(0));
+        assert_eq!(f.rss_file, Some(2184 * 1024));
         assert_eq!(f.threads, Some(6));
         assert_eq!(f.voluntary_ctxt_switches, Some(15));
         assert_eq!(f.nonvoluntary_ctxt_switches, Some(54));
@@ -563,5 +680,105 @@ cancelled_write_bytes: 631136256";
         let (ok, content) = check_section_status("some data\nPSTAT_OK\n");
         assert!(ok);
         assert_eq!(content.trim(), "some data");
+    }
+
+    #[test]
+    fn parse_smaps_multiple_vmas() {
+        let content = "\
+00400000-004a2000 r-xp 00000000 fd:01 12345                              /usr/bin/foo
+Size:                648 kB
+Rss:                 192 kB
+Pss:                 192 kB
+Anonymous:             0 kB
+Swap:                  0 kB
+VmFlags: rd ex mr mw me dw sd
+004a2000-004a3000 rw-p 000a2000 fd:01 12345                              /usr/bin/foo
+Size:                  4 kB
+Rss:                   4 kB
+Pss:                   4 kB
+Anonymous:             4 kB
+Swap:                  0 kB
+VmFlags: rd wr mr mw me ac sd
+7fff12345000-7fff12367000 rw-p 00000000 00:00 0                          [stack]
+Size:                140 kB
+Rss:                  16 kB
+Pss:                  16 kB
+Anonymous:            16 kB
+Swap:                  0 kB
+VmFlags: rd wr mr mw me gd ac
+";
+        let entries = parse_smaps(content);
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].perm, "r-xp");
+        assert_eq!(entries[0].path.as_deref(), Some("/usr/bin/foo"));
+        assert_eq!(entries[0].label, "foo");
+        assert_eq!(entries[0].size, 648 * 1024);
+        assert_eq!(entries[0].rss, 192 * 1024);
+        assert_eq!(entries[0].anonymous, 0);
+
+        assert_eq!(entries[1].perm, "rw-p");
+        assert_eq!(entries[1].label, "foo");
+        assert_eq!(entries[1].anonymous, 4 * 1024);
+
+        assert_eq!(entries[2].path, None);
+        assert_eq!(entries[2].label, "[stack]");
+        assert_eq!(entries[2].rss, 16 * 1024);
+    }
+
+    #[test]
+    fn parse_smaps_anonymous_mapping_has_no_label() {
+        let content = "\
+b2a00000-b2beb000 rw-p 00000000 00:00 0
+Size:               1964 kB
+Rss:                 104 kB
+Pss:                 104 kB
+Anonymous:           104 kB
+Swap:                 32 kB
+";
+        let entries = parse_smaps(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, None);
+        assert_eq!(entries[0].label, "anon");
+        assert_eq!(entries[0].rss, 104 * 1024);
+        assert_eq!(entries[0].swap, 32 * 1024);
+    }
+
+    #[test]
+    fn parse_smaps_empty_returns_empty() {
+        assert!(parse_smaps("").is_empty());
+    }
+
+    #[test]
+    fn parse_smaps_detects_glibc_arena() {
+        // Arena data rw-p at b2200000-b22df000 (892 KB)
+        // followed by guard ---p at b22df000-b2300000 (132 KB, contiguous).
+        // An unrelated unlabeled rw-p anon (not followed by a guard) should
+        // stay as "anon" (not promoted).
+        let content = "\
+b2200000-b22df000 rw-p 00000000 00:00 0
+Size:                892 kB
+Rss:                   8 kB
+Pss:                   8 kB
+Anonymous:             8 kB
+Swap:                  0 kB
+b22df000-b2300000 ---p 00000000 00:00 0
+Size:                132 kB
+Rss:                   0 kB
+Pss:                   0 kB
+Anonymous:             0 kB
+Swap:                  0 kB
+c0000000-c0100000 rw-p 00000000 00:00 0
+Size:               1024 kB
+Rss:                  12 kB
+Pss:                  12 kB
+Anonymous:            12 kB
+Swap:                  0 kB
+";
+        let entries = parse_smaps(content);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].label, "[glibc-arena]");
+        assert_eq!(entries[1].label, "anon"); // the guard stays as anon
+        assert_eq!(entries[2].label, "anon"); // standalone anon, no guard pair
     }
 }

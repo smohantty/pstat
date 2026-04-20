@@ -5,7 +5,7 @@ use chrono::Utc;
 
 use crate::collector::{Collector, DiscoverQuery, ProcessTarget, PstatError, ticks_to_millis};
 use crate::proc_parser;
-use crate::schema::{CollectionSource, ProcessInfo, ProcessSnapshot};
+use crate::schema::{CollectionSource, MemoryMapReport, ProcessInfo, ProcessSnapshot};
 
 pub struct LocalCollector;
 
@@ -68,6 +68,9 @@ impl LocalCollector {
         let cgroup =
             Self::read_proc_optional(pid, "cgroup").and_then(|c| proc_parser::parse_cgroup(&c));
 
+        // /proc/[pid]/exe is a magic symlink — fs::metadata follows it and returns the binary's stat.
+        let exe_size = fs::metadata(Self::proc_path(pid, "exe")).ok().map(|m| m.len());
+
         let total_mem = self.total_memory().unwrap_or(1);
         let rss = status.vm_rss.unwrap_or(0);
         let mem_percent = if total_mem > 0 {
@@ -91,6 +94,8 @@ impl LocalCollector {
             vm_peak: status.vm_peak.unwrap_or(0),
             vm_swap: status.vm_swap.unwrap_or(0),
             shared: status.rss_shared.unwrap_or(0),
+            rss_file: status.rss_file.unwrap_or(0),
+            exe_size,
             mem_percent,
             pss: smaps.pss,
             uss: smaps.uss(),
@@ -189,6 +194,30 @@ impl Collector for LocalCollector {
         let content =
             fs::read_to_string("/proc/meminfo").map_err(|e| PstatError::Other(e.into()))?;
         proc_parser::parse_meminfo_total(&content)
+    }
+
+    fn memory_map(&self, target: &ProcessTarget) -> Result<MemoryMapReport, PstatError> {
+        let (pid, _) = resolve_local(self, target)?;
+        let smaps = Self::read_proc(pid, "smaps")?;
+        let entries = proc_parser::parse_smaps(&smaps);
+
+        let comm = Self::read_proc(pid, "comm")?.trim().to_string();
+        let exe_path = fs::read_link(Self::proc_path(pid, "exe"))
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()));
+        let exe_size = fs::metadata(Self::proc_path(pid, "exe")).ok().map(|m| m.len());
+        let total_rss = entries.iter().map(|e| e.rss).sum();
+
+        Ok(MemoryMapReport {
+            pid,
+            name: comm,
+            exe_path,
+            exe_size,
+            total_rss,
+            entries,
+            timestamp: Utc::now(),
+            source: CollectionSource::Local,
+        })
     }
 }
 

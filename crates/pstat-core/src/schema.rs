@@ -73,6 +73,11 @@ pub struct ProcessSnapshot {
     pub vm_swap: u64,
     /// RssShmem: shared memory portion of RSS.
     pub shared: u64,
+    /// RssFile: file-backed portion of RSS (code, ro-data of mapped binaries and libraries).
+    pub rss_file: u64,
+    /// On-disk size of the process executable (target of /proc/[pid]/exe).
+    /// None if the exe symlink is unreadable (kernel threads, permission errors, short-lived processes).
+    pub exe_size: Option<u64>,
     /// Derived: rss / MemTotal * 100.
     pub mem_percent: f64,
 
@@ -133,6 +138,87 @@ pub struct ProcessInfo {
     pub pid: u32,
     pub name: String,
     pub start_time: u64,
+}
+
+/// One virtual memory area, parsed from /proc/[pid]/smaps.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VmaEntry {
+    /// VMA start address (inclusive).
+    pub start_addr: u64,
+    /// VMA end address (exclusive).
+    pub end_addr: u64,
+    /// Permission flags like "r-xp", "rw-p", "rw-s" (4 chars: rwx + p/s).
+    pub perm: String,
+    /// Backing file path (None for purely anonymous mappings).
+    pub path: Option<String>,
+    /// Display label: basename of path, bracket label like "[heap]",
+    /// "[stack]", "[tstack: ...]", synthetic "[glibc-arena]" for detected
+    /// malloc arenas, or "anon" for unnamed anonymous mappings.
+    pub label: String,
+    /// Virtual size (kernel "Size" field).
+    pub size: u64,
+    /// Resident set size.
+    pub rss: u64,
+    /// Proportional set size.
+    pub pss: u64,
+    /// Anonymous bytes (includes CoW'd file-backed pages and MAP_ANON).
+    pub anonymous: u64,
+    /// Swapped-out bytes.
+    pub swap: u64,
+}
+
+/// Coarse classification of a VMA for the summary view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VmaKind {
+    /// The main executable (matches /proc/[pid]/exe).
+    Binary,
+    /// Any other file-backed private mapping (typically .so shared libraries).
+    SharedLibrary,
+    /// `[heap]`
+    Heap,
+    /// `[stack]` (main thread) or `[stack:TID]` / `[tstack: ...]` (thread stacks).
+    Stack,
+    /// Anonymous mapping with no label (glibc arenas, malloc large blocks, etc.).
+    AnonOther,
+    /// MAP_SHARED mapping (perm ends with 's').
+    Shmem,
+}
+
+impl VmaEntry {
+    /// Classify this VMA against the known exe path.
+    pub fn classify(&self, exe_path: Option<&str>) -> VmaKind {
+        if self.perm.ends_with('s') {
+            return VmaKind::Shmem;
+        }
+        if let (Some(ep), Some(p)) = (exe_path, self.path.as_deref()) {
+            if p == ep {
+                return VmaKind::Binary;
+            }
+        }
+        if self.path.is_some() {
+            return VmaKind::SharedLibrary;
+        }
+        match self.label.as_str() {
+            // Main brk heap + detected glibc secondary arenas (per-thread mmap'd heaps).
+            "[heap]" | "[glibc-arena]" => VmaKind::Heap,
+            s if s.starts_with("[stack") || s.starts_with("[tstack") => VmaKind::Stack,
+            _ => VmaKind::AnonOther,
+        }
+    }
+}
+
+/// Full memory-map report from /proc/[pid]/smaps plus identity metadata.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryMapReport {
+    pub pid: u32,
+    pub name: String,
+    pub exe_path: Option<String>,
+    pub exe_size: Option<u64>,
+    /// Aggregate VmRSS derived by summing entry RSS.
+    pub total_rss: u64,
+    pub entries: Vec<VmaEntry>,
+    pub timestamp: DateTime<Utc>,
+    pub source: CollectionSource,
 }
 
 /// Time-series output from `pstat sample`.
@@ -403,6 +489,8 @@ mod tests {
             vm_peak: 5 * 1024 * 1024,
             vm_swap: 0,
             shared: 512 * 1024,
+            rss_file: 256 * 1024,
+            exe_size: Some(2 * 1024 * 1024),
             mem_percent: 0.5,
             cpu_user_ms: 1000,
             cpu_system_ms: 200,

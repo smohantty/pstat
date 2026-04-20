@@ -1,4 +1,4 @@
-use crate::schema::{ProcessInfo, ProcessSnapshot};
+use crate::schema::{MemoryMapReport, ProcessInfo, ProcessSnapshot};
 
 /// How to identify the target process.
 #[derive(Clone, Debug)]
@@ -52,6 +52,9 @@ pub trait Collector {
     fn snapshot(&self, target: &ProcessTarget) -> Result<ProcessSnapshot, PstatError>;
     fn discover(&self, query: &DiscoverQuery) -> Result<Vec<ProcessInfo>, PstatError>;
     fn total_memory(&self) -> Result<u64, PstatError>;
+    /// Build a full memory-map report from /proc/[pid]/smaps. Significantly
+    /// more expensive than snapshot — reads every VMA.
+    fn memory_map(&self, target: &ProcessTarget) -> Result<MemoryMapReport, PstatError>;
 }
 
 pub(crate) fn ticks_to_millis(ticks: u64, hz: u64) -> u64 {
