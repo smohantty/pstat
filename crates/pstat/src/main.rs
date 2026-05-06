@@ -12,7 +12,7 @@ use pstat_core::diff::compute_diff;
 use pstat_core::local::LocalCollector;
 use pstat_core::remote::RsdbCollector;
 use pstat_core::report;
-use pstat_core::schema::{ProcessSnapshot, SampleSeries};
+use pstat_core::schema::{MemoryMapReport, ProcessSnapshot, SampleSeries};
 
 #[derive(Debug, Parser)]
 #[command(name = "pstat")]
@@ -80,13 +80,18 @@ enum Commands {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Generate a report from a sample series file.
+    /// Generate a report from a captured JSON file.
+    /// Auto-detects sample series, snapshot, and memory-map files.
     Report {
-        samples_file: String,
+        /// Path to a captured JSON file.
+        path: String,
         #[arg(long, value_enum)]
         format: Option<OutputFormat>,
         #[arg(long, value_name = "PATH")]
         output: Option<String>,
+        /// Show all fields for snapshot/map reports (per-mapping detail, virtual mem, etc.).
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Show per-VMA memory composition (where the RSS is going).
     Map {
@@ -220,6 +225,7 @@ rules:
 - remote: add --target <addr>
 - sample default: NDJSON snapshots, then final summary line
 - sample/report json: full SampleSeries json; report recomputes summary
+- report auto-detects sample series, snapshot, or memory map JSON
 - non-tty errors: stderr json {"error":{"code","message"}}
 
 snapshot [selector] [--target <addr>] [--format json] [--output <path>]
@@ -227,7 +233,7 @@ sample [selector] [--target <addr>] [--interval <duration>] [--count <usize>] [-
 map [selector] [--target <addr>] [--format json] [--output <path>] [-v]
 discover [--target <addr>] [--filter <glob>]
 diff <snapshot1.json> <snapshot2.json> [--format json]
-report <samples.json> [--format json] [--output <path>]
+report <path> [--format json] [--output <path>] [-v]
 "#
 }
 
@@ -252,6 +258,83 @@ fn record_or_verify_sample_identity(
             Ok(())
         }
     }
+}
+
+/// One of the JSON shapes pstat can render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportKind {
+    SampleSeries,
+    MemoryMap,
+    Snapshot,
+}
+
+/// Inspect top-level keys to disambiguate the three captured JSON shapes.
+fn detect_report_kind(content: &str) -> Result<ReportKind, PstatError> {
+    let value: serde_json::Value = serde_json::from_str(content)
+        .map_err(|e| PstatError::ParseError(format!("invalid JSON: {e}")))?;
+    let obj = value.as_object().ok_or_else(|| {
+        PstatError::ParseError("expected JSON object at top level".into())
+    })?;
+
+    if obj.contains_key("samples") && obj.contains_key("interval_ms") {
+        Ok(ReportKind::SampleSeries)
+    } else if obj.contains_key("entries") && obj.contains_key("total_rss") {
+        Ok(ReportKind::MemoryMap)
+    } else if obj.contains_key("rss") && obj.contains_key("vms") && obj.contains_key("pid") {
+        Ok(ReportKind::Snapshot)
+    } else {
+        Err(PstatError::ParseError(
+            "unrecognized JSON shape — expected sample series, snapshot, or memory map".into(),
+        ))
+    }
+}
+
+/// Render a single file's contents to the chosen output format.
+fn render_file_report(
+    path: &std::path::Path,
+    fmt: &OutputFormat,
+    verbose: bool,
+) -> Result<String, PstatError> {
+    let display = path.display();
+    let content = fs::read_to_string(path)
+        .map_err(|e| PstatError::Other(anyhow::anyhow!("{display}: {e}")))?;
+    let kind = detect_report_kind(&content)
+        .map_err(|e| PstatError::ParseError(format!("{display}: {e}")))?;
+
+    let text = match kind {
+        ReportKind::SampleSeries => {
+            let mut series: SampleSeries = serde_json::from_str(&content)
+                .map_err(|e| PstatError::ParseError(format!("{display}: {e}")))?;
+            refresh_summary(&mut series);
+            match fmt {
+                OutputFormat::Json => serde_json::to_string_pretty(&series)
+                    .map_err(|e| PstatError::Other(e.into()))?,
+                OutputFormat::Table => report::format_report_table(&series),
+                OutputFormat::Md => report::format_markdown(&series),
+            }
+        }
+        ReportKind::Snapshot => {
+            let snap: ProcessSnapshot = serde_json::from_str(&content)
+                .map_err(|e| PstatError::ParseError(format!("{display}: {e}")))?;
+            match fmt {
+                OutputFormat::Json => report::format_json(&snap),
+                OutputFormat::Table if verbose => report::format_table_verbose(&snap),
+                OutputFormat::Table => report::format_table(&snap),
+                OutputFormat::Md if verbose => report::format_snapshot_md_verbose(&snap),
+                OutputFormat::Md => report::format_snapshot_md(&snap),
+            }
+        }
+        ReportKind::MemoryMap => {
+            let map: MemoryMapReport = serde_json::from_str(&content)
+                .map_err(|e| PstatError::ParseError(format!("{display}: {e}")))?;
+            match fmt {
+                OutputFormat::Json => report::format_map_json(&map),
+                OutputFormat::Table => report::format_map_table(&map, verbose),
+                OutputFormat::Md => report::format_map_md(&map, verbose),
+            }
+        }
+    };
+    Ok(text)
 }
 
 fn run() -> Result<(), PstatError> {
@@ -443,22 +526,13 @@ fn run() -> Result<(), PstatError> {
         }
 
         Commands::Report {
-            samples_file,
+            path,
             format,
             output,
+            verbose,
         } => {
-            let content = fs::read_to_string(&samples_file)
-                .map_err(|e| PstatError::Other(anyhow::anyhow!("{samples_file}: {e}")))?;
-            let mut series: SampleSeries = serde_json::from_str(&content)
-                .map_err(|e| PstatError::ParseError(format!("{samples_file}: {e}")))?;
-            refresh_summary(&mut series);
             let fmt = default_format(format);
-            let text = match fmt {
-                OutputFormat::Json => serde_json::to_string_pretty(&series)
-                    .map_err(|e| PstatError::Other(e.into()))?,
-                OutputFormat::Table => report::format_report_table(&series),
-                OutputFormat::Md => report::format_markdown(&series),
-            };
+            let text = render_file_report(std::path::Path::new(&path), &fmt, verbose)?;
             write_output(&text, output.as_deref()).map_err(|e| PstatError::Other(e))?;
             if !text.ends_with('\n') {
                 println!();
@@ -591,6 +665,22 @@ mod tests {
         assert!(schema.contains("report recomputes summary"));
         assert!(schema.contains("non-tty errors: stderr json"));
         assert!(schema.contains("snapshot [selector]"));
+        assert!(schema.contains("report auto-detects"));
+    }
+
+    #[test]
+    fn detect_report_kind_disambiguates_three_shapes() {
+        let series = r#"{"process_name":"x","pid":1,"source":"Local","interval_ms":1000,"samples":[],"summary":null}"#;
+        assert_eq!(detect_report_kind(series).unwrap(), ReportKind::SampleSeries);
+
+        let map = r#"{"pid":1,"name":"x","exe_path":null,"exe_size":null,"total_rss":0,"entries":[],"timestamp":"2026-01-01T00:00:00Z","source":"Local"}"#;
+        assert_eq!(detect_report_kind(map).unwrap(), ReportKind::MemoryMap);
+
+        let snap = r#"{"pid":1,"ppid":0,"name":"x","cmdline":[],"state":"Running","start_time":0,"rss":0,"vm_hwm":0,"vms":0,"vm_peak":0,"vm_swap":0,"shared":0,"rss_file":0,"exe_size":null,"mem_percent":0.0,"cpu_user_ms":0,"cpu_system_ms":0,"cpu_percent":null,"io_read_bytes":null,"io_write_bytes":null,"io_syscr":null,"io_syscw":null,"num_threads":1,"num_fds":null,"ctx_switches_voluntary":0,"ctx_switches_involuntary":0,"pss":null,"uss":null,"shared_clean":null,"shared_dirty":null,"private_clean":null,"private_dirty":null,"referenced":null,"anonymous":null,"swap_pss":null,"oom_score":null,"oom_score_adj":null,"cgroup":null,"timestamp":"2026-01-01T00:00:00Z","source":"Local"}"#;
+        assert_eq!(detect_report_kind(snap).unwrap(), ReportKind::Snapshot);
+
+        assert!(detect_report_kind(r#"{"hello":"world"}"#).is_err());
+        assert!(detect_report_kind("not json").is_err());
     }
 }
 
